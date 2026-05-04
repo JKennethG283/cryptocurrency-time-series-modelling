@@ -11,7 +11,7 @@ Walk-forward experiments on **Bitcoin, Ethereum, and Solana** using **OHLCV-deri
 | [data_preparation.py](data_preparation.py) | OHLCV → features + multi-horizon targets → `data/pre-processing/*_ml.csv` |
 | [merge.py](merge.py) | ML tables + macro + on-chain → `data/merge/*_merged.csv` (macro: `ffill` only, sorted by time) |
 | [model.py](model.py) | **Default** quick run: BTC + ETH, return & volatility, `results/quick/` |
-| [benchmark.py](benchmark.py) | **Full** grid: all merged datasets and target families |
+| [benchmark.py](benchmark.py) | **Full** grid: all merged datasets and target families (optional **GARCH** / **LSTM** via flags) |
 | [experiment.py](experiment.py) | Ablations, context sweeps, permutation importance (sklearn) |
 | [main.py](main.py) | One command: pre-process → merge → `model.py` (see [Run everything](#run-everything)) |
 | [docs/features_targets_explanation.md](docs/features_targets_explanation.md) | Column and target definitions |
@@ -47,6 +47,8 @@ pip install -r requirements-dev.txt
 
 - **Metrics** written by `benchmark` / `model`: **MAE**, **RMSE**, **MASE** (MASE vs a naive h-step target lag benchmark). You compare models on the **same** walk-forward grid and the **same** targets — not a trading PnL claim.
 - **Walk-forward:** Daily: expanding history. Hourly: sliding context + last *N* rows for eval (see `benchmark.py` docstring).
+- **ARIMA / Prophet / sklearn protocol:** `ARIMA` is pure univariate ARIMA by default; `SARIMAX` is only used when `--use-sarimax-exog` is passed. ARIMA-family, Prophet, **RandomForest**, and **XGBoost** all use the **same** horizon-aware embargo on training **labels** (through `t-h`) for multi-horizon forward-window targets like `target_vol_fwd_24`.
+- **GARCH / LSTM:** `model.py` runs **GARCH(1,1)** on `log_ret` for volatility targets (one-step conditional σ vs `target_vol_fwd_h`, comparable scale to per-period vol — not `σ√h`) and a small **LSTM** on lagged top exogenous features (use `--skip-garch` / `--skip-lstm` to omit). Full `benchmark.py` skips them by default for runtime; pass `--enable-garch` and/or `--enable-lstm` to include. Requires `arch` (listed in `requirements.txt`) and `torch`.
 - **Slower baselines (ARIMA, Prophet, VAR, NLinear):** use `--ts-eval-stride k` to evaluate only every *k*-th origin (e.g. `24` on hourly) to cut runtime. Tree models (RF, XGB) still predict on every step in their evaluated range, with `refit_every_*` controlling refit frequency.
 - **Limitations:** (1) Macro series use **as-of forward-fill** on the price bar timeline — that is not the same as “value known to the market at *t*” if releases lag; treat macro as a coarse covariate. (2) Report clearly that results are **off-sample walk-forward** under a fixed protocol, not live trading results.
 

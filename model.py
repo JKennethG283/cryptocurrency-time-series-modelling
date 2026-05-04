@@ -10,6 +10,10 @@ For the full six-dataset grid and all target families, use ``python benchmark.py
 
 Hourly defaults: sliding context **600**, evaluation on the last **1000** rows. Writes metrics under
 ``results/quick/`` by default so full ``benchmark`` runs in ``results/tables`` are not overwritten.
+
+Also runs **GARCH(1,1)** on ``log_ret`` for volatility and a small **LSTM** on lagged top exogenous features
+(``--skip-garch`` / ``--skip-lstm`` to omit). Full ``benchmark.py`` skips these by default unless
+``--enable-garch`` / ``--enable-lstm`` is passed.
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ def parse_args() -> EvalConfig:
         help="Merged CSV filenames (default: four BTC+ETH daily/hourly files).",
     )
     p.add_argument("--refit-every-daily", type=int, default=1)
-    p.add_argument("--refit-every-hourly", type=int, default=168)
+    p.add_argument("--refit-every-hourly", type=int, default=1)
     p.add_argument("--min-train-daily", type=int, default=300)
     p.add_argument("--min-train-hourly", type=int, default=2000)
     p.add_argument("--max-rows-daily", type=int, default=None)
@@ -67,7 +71,7 @@ def parse_args() -> EvalConfig:
         "--ts-eval-stride",
         type=int,
         default=1,
-        help="Evaluate ARIMA/Prophet/VAR/NLinear every k-th origin (1=all).",
+        help="Evaluate ARIMA/Prophet/GARCH/VAR/NLinear every k-th origin (1=all).",
     )
     p.add_argument(
         "--use-sarimax-exog",
@@ -89,6 +93,17 @@ def parse_args() -> EvalConfig:
         type=int,
         default=15,
     )
+    p.add_argument(
+        "--skip-garch",
+        action="store_true",
+        help="Skip GARCH(1,1) volatility baseline (default: run GARCH).",
+    )
+    p.add_argument(
+        "--skip-lstm",
+        action="store_true",
+        help="Skip LSTM regressor (default: run LSTM).",
+    )
+    p.add_argument("--lstm-epochs", type=int, default=6, help="LSTM training epochs per refit (lower is faster).")
     args = p.parse_args()
     return EvalConfig(
         merge_dir=args.merge_dir,
@@ -111,6 +126,9 @@ def parse_args() -> EvalConfig:
         target_pairs_by_freq=_DEFAULT_TARGET_PAIRS_BY_FREQ,
         neural_max_steps=args.neural_max_steps,
         daily_neural_context=args.daily_neural_context,
+        skip_garch=args.skip_garch,
+        skip_lstm=args.skip_lstm,
+        lstm_epochs=args.lstm_epochs,
     )
 
 

@@ -52,7 +52,10 @@ By default the script loops **six datasets** (bitcoin/ethereum/solana × daily/h
 For each dataset and each target family (returns / volatility / volume) and each horizon, it fits:
 
 * **RandomForest**, **XGBoost** (tabular walk-forward),
-* **ARIMAX** label (implementation: ARIMA by default; optional SARIMAX with ``--use-sarimax-exog``),
+* **ARIMA** (optional **SARIMAX** with ``--use-sarimax-exog``),
+* **GARCH(1,1)** on ``log_ret`` for **volatility** targets only (optional ``--enable-garch`` on ``benchmark.py``;
+  enabled by default on ``model.py``),
+* **LSTM** on lagged top exogenous columns (optional ``--enable-lstm`` on ``benchmark.py``; enabled by default on ``model.py``),
 * **VAR_volume** (volume targets only),
 * **Prophet** (unless ``--skip-prophet``),
 * **NLinear** (NeuralForecast) once per target — daily matches other models: **expanding** history and
@@ -66,14 +69,20 @@ That is **more than six models** — six is the number of **data files**, not th
 Walk-forward windowing
 ======================
 
-* **Daily** (*expanding*): for origin ``t``, train on rows ``0 .. t-1``, predict row ``t``.
+* **Daily** (*expanding*): for origin ``t``, train tabular models on rows ``0 .. t-h`` (label embargo),
+  predict row ``t``.
 * **Hourly** (*sliding + tail*): for origin ``t`` in the last ``hourly_eval_tail`` rows (and
-  ``t >= hourly_sliding_context``), train on rows ``t - C .. t - 1`` with ``C = hourly_sliding_context``,
+  ``t >= hourly_sliding_context``), train on rows ``t - C .. t - h`` with ``C = hourly_sliding_context``,
   predict row ``t``.
 
-Sklearn models refit every ``refit_every_*`` but still predict every step in the evaluated range.
-ARIMA / Prophet / VAR / NLinear use ``ts_eval_stride`` on the same ``t`` grid (for hourly, stride is
-relative to the first origin in the tail).
+**ARIMA/SARIMAX, Prophet, and sklearn (RF / XGB) horizon embargo:** for target horizon ``h``, training at
+origin ``t`` only uses target rows up to ``t-h`` (inclusive). This prevents optimistic overlap when labels are
+forward windows (e.g., ``target_vol_fwd_24``), where nearby label rows share future returns.
+
+**Sklearn** models refit every ``refit_every_*`` but still predict every step in the evaluated range.
+ARIMA / Prophet / GARCH / VAR / NLinear use ``ts_eval_stride`` on the same ``t`` grid (for hourly, stride is
+relative to the first origin in the tail). **LSTM** follows the sklearn grid (prediction every step) with
+``refit_every_*`` controlling refits.
 
 How long it takes (rough)
 ==========================
@@ -83,7 +92,8 @@ How long it takes (rough)
 * **Hourly** with defaults (3000 context, 1000 tail) is far fewer origins than full-series expanding
   walk-forward; still use ``--ts-eval-stride`` (e.g. 24–168) and/or ``--skip-neural`` if needed.
 
-NLinear uses ``h=1`` in index space (the economic horizon is already in the target column).
+**NLinear** trains on embargoed series (labels through ``t-h``) and uses NeuralForecast ``h`` equal to the
+target horizon so the **last** multi-step forecast aligns with ``y[t]``.
 
 Prophet / NLinear troubleshooting
 ===================================
@@ -146,7 +156,7 @@ class EvalConfig:
     results_dir: Path
     datasets: Optional[list[str]] = None
     refit_every_daily: int = 1
-    refit_every_hourly: int = 168
+    refit_every_hourly: int = 1
     min_train_daily: int = 300
     min_train_hourly: int = 2000
     max_rows_daily: Optional[int] = None
@@ -171,9 +181,17 @@ class EvalConfig:
     # Like ``target_pairs`` but keyed by ``freq`` (``"hourly"`` / ``"daily"``) when horizons differ.
     # If set, takes precedence over ``target_pairs`` for filtering.
     target_pairs_by_freq: Optional[dict[str, tuple[tuple[str, int], ...]]] = None
-    # Evaluate ARIMA/Prophet/VAR/NLinear only every k-th origin (1 = every step).
+    # Evaluate ARIMA/Prophet/GARCH/VAR/NLinear only every k-th origin (1 = every step).
     ts_eval_stride: int = 1
     use_sarimax_exog: bool = False
+    # GARCH(1,1) on log returns for volatility only (requires ``arch``). Off by default for full ``benchmark.py``.
+    skip_garch: bool = True
+    # LSTM on lagged top-exog windows (requires ``torch``). Off by default for full ``benchmark.py``.
+    skip_lstm: bool = True
+    lstm_hidden: int = 32
+    lstm_seq_len: int = 24
+    lstm_epochs: int = 8
+    lstm_feature_top_k: int = 12
 
 
 def hourly_eval_t_range(n: int, context: int, tail: int) -> tuple[int, int]:
@@ -335,8 +353,9 @@ def walk_forward_sklearn(
     cfg: EvalConfig,
     make_model: Callable[[], Any],
     model_name: str,
+    h: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """Train on rows ``0..t-1`` (daily) or sliding ``t-C..t-1`` (hourly); predict row ``t``."""
+    """Same horizon-aware label embargo as ARIMA: train labels only through index ``t-h``; predict ``y[t]``."""
     n = len(X)
     refit_every = refit_every_for_freq(freq, cfg)
     y_vals = y.to_numpy(dtype=float)
@@ -352,23 +371,53 @@ def walk_forward_sklearn(
             return (np.asarray([]), np.asarray([]), np.asarray([]), [])
         for t in range(t_first, t_end):
             start = t - C
+            train_end = t - h + 1
+            if train_end <= start:
+                y_true_list.append(float(y_vals[t]))
+                y_pred_list.append(float("nan"))
+                idx_list.append(t)
+                continue
             do_refit = (t == t_first) or ((t - t_first) % refit_every == 0)
             if do_refit or model is None:
                 model = make_model()
-                model.fit(X.iloc[start:t].to_numpy(), y_vals[start:t])
-            pred = model.predict(X.iloc[t : t + 1].to_numpy())
-            y_hat = float(pred.ravel()[0])
+                try:
+                    model.fit(X.iloc[start:train_end].to_numpy(), y_vals[start:train_end])
+                except Exception:
+                    model = None
+            if model is None:
+                y_hat = float("nan")
+            else:
+                try:
+                    pred = model.predict(X.iloc[t : t + 1].to_numpy())
+                    y_hat = float(pred.ravel()[0])
+                except Exception:
+                    y_hat = float("nan")
             y_true_list.append(float(y_vals[t]))
             y_pred_list.append(y_hat)
             idx_list.append(t)
     else:
         min_train = min_train_for_freq(freq, cfg)
         for t, do_refit in walk_forward_indices(n, min_train, refit_every):
+            train_end = t - h + 1
+            if train_end < 2:
+                y_true_list.append(float(y_vals[t]))
+                y_pred_list.append(float("nan"))
+                idx_list.append(t)
+                continue
             if do_refit or model is None:
                 model = make_model()
-                model.fit(X.iloc[:t].to_numpy(), y_vals[:t])
-            pred = model.predict(X.iloc[t : t + 1].to_numpy())
-            y_hat = float(pred.ravel()[0])
+                try:
+                    model.fit(X.iloc[:train_end].to_numpy(), y_vals[:train_end])
+                except Exception:
+                    model = None
+            if model is None:
+                y_hat = float("nan")
+            else:
+                try:
+                    pred = model.predict(X.iloc[t : t + 1].to_numpy())
+                    y_hat = float(pred.ravel()[0])
+                except Exception:
+                    y_hat = float("nan")
             y_true_list.append(float(y_vals[t]))
             y_pred_list.append(y_hat)
             idx_list.append(t)
@@ -385,8 +434,14 @@ def walk_forward_arima(
     X: pd.DataFrame,
     freq: str,
     cfg: EvalConfig,
+    h: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """ARIMA by default; optional SARIMAX with top exog. Refits each evaluated origin."""
+    """
+    ARIMA by default; optional SARIMAX with top exog. Refits each evaluated origin.
+
+    Uses horizon-aware embargo: at origin ``t`` and target horizon ``h``, train only on
+    target rows ``j <= t-h`` so train labels do not overlap the test label's forward window.
+    """
     n = len(y)
     yv = y.to_numpy(dtype=float)
 
@@ -418,11 +473,14 @@ def walk_forward_arima(
                 continue
             start = 0
 
-        y_train = yv[start:t]
+        train_end = t - h + 1  # end-exclusive slice; includes j=t-h
+        if train_end <= start:
+            continue
+        y_train = yv[start:train_end]
         y_hat = float(np.nan)
         if cfg.use_sarimax_exog:
             try:
-                ex_train = Xe.iloc[start:t].astype(float)
+                ex_train = Xe.iloc[start:train_end].astype(float)
                 ex_future = Xe.iloc[t : t + 1].astype(float)
                 mod = SARIMAX(
                     y_train,
@@ -534,7 +592,13 @@ def walk_forward_prophet(
     h: int,
     cfg: EvalConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    _ = h  # horizon encoded in target column; index-space forecast is 1-step
+    """
+    Prophet on ``ds`` + ``y`` only (no tabular ``X``). Index-space forecast is 1-step at ``t``.
+
+    Uses the same horizon-aware embargo as ARIMA: at origin ``t``, history ``y`` only includes
+    indices ``<= t-h`` (slice ``... : t-h+1``), so training labels do not overlap the test label's
+    forward window for multi-bar targets.
+    """
     n = len(y)
     yv = y.to_numpy(dtype=float)
     ds = _prophet_ds(timestamps)
@@ -562,14 +626,20 @@ def walk_forward_prophet(
             continue
         from prophet import Prophet
 
+        train_end = t - h + 1  # end-exclusive; last label index t-h (same as walk_forward_arima)
         if freq == "hourly":
             start = t - C
-            hist = pd.DataFrame({"ds": ds.iloc[start:t], "y": yv[start:t]})
+            if train_end <= start:
+                continue
+            hist = pd.DataFrame({"ds": ds.iloc[start:train_end], "y": yv[start:train_end]})
         else:
-            hist = pd.DataFrame({"ds": ds.iloc[:t], "y": yv[:t]})
+            start = 0
+            if train_end <= start:
+                continue
+            hist = pd.DataFrame({"ds": ds.iloc[:train_end], "y": yv[:train_end]})
         y_hat = float(np.nan)
-        if np.nanstd(hist["y"].values) < 1e-12:
-            y_hat = float(yv[t - 1]) if t > 0 else float(yv[t])
+        if len(hist) < 2 or np.nanstd(hist["y"].values) < 1e-12:
+            y_hat = float(yv[train_end - 1]) if train_end > 0 else float(yv[t])
         else:
             try:
                 m = Prophet(
@@ -595,6 +665,250 @@ def walk_forward_prophet(
     )
 
 
+def walk_forward_garch(
+    df: pd.DataFrame,
+    y: pd.Series,
+    freq: str,
+    cfg: EvalConfig,
+    h: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    GARCH(1,1) on ``log_ret`` with the same label embargo as ARIMA (train returns through ``t-h``).
+
+    One-step conditional volatility ``sigma_1`` (per-bar std of ``log_ret``) is compared to
+    ``target_vol_fwd_h``, which is the **sample std** of ``h`` future one-period returns — same **scale
+    order** as ``sigma_1``, unlike ``sigma_1 * sqrt(h)`` (volatility of an ``h``-period **sum**).
+    """
+    try:
+        from arch import arch_model
+    except Exception:
+        return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+
+    if "log_ret" not in df.columns:
+        return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+
+    lr = df["log_ret"].astype(float)
+    n = len(y)
+    yv = y.to_numpy(dtype=float)
+
+    if freq == "hourly":
+        C = cfg.hourly_sliding_context
+        t_first, t_end = hourly_eval_t_range(n, C, cfg.hourly_eval_tail)
+        if t_first >= t_end:
+            return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+    else:
+        t_first = min_train_for_freq(freq, cfg)
+        t_end = n
+
+    y_true_list: list[float] = []
+    y_pred_list: list[float] = []
+    idx_list: list[int] = []
+    scale = 100.0
+
+    for t in range(t_first, t_end):
+        if (t - t_first) % cfg.ts_eval_stride != 0:
+            continue
+        if freq == "hourly":
+            start = t - C
+        else:
+            start = 0
+        train_end = t - h + 1
+        if train_end <= start + 80:
+            y_true_list.append(float(yv[t]))
+            y_pred_list.append(float("nan"))
+            idx_list.append(t)
+            continue
+        r = lr.iloc[start:train_end].to_numpy(dtype=float)
+        m = np.isfinite(r)
+        r = r[m]
+        if len(r) < 200:
+            y_true_list.append(float(yv[t]))
+            y_pred_list.append(float("nan"))
+            idx_list.append(t)
+            continue
+        y_hat = float("nan")
+        try:
+            am = arch_model(r * scale, mean="Constant", vol="Garch", p=1, q=1)
+            res = am.fit(disp="off", show_warning=False, options={"maxiter": 200})
+            v1 = float(res.forecast(horizon=1, reindex=False).variance.iloc[-1, 0])
+            sigma1 = float(np.sqrt(max(v1, 1e-20))) / scale
+            y_hat = sigma1
+        except Exception:
+            y_hat = float("nan")
+        y_true_list.append(float(yv[t]))
+        y_pred_list.append(y_hat)
+        idx_list.append(t)
+
+    return (
+        np.asarray(y_true_list),
+        np.asarray(y_pred_list),
+        np.asarray(idx_list),
+        [],
+    )
+
+
+def _train_lstm_once(
+    Xa: np.ndarray,
+    ya: np.ndarray,
+    hidden: int,
+    epochs: int,
+) -> tuple[Any, np.ndarray, np.ndarray] | None:
+    import torch
+    import torch.nn as nn
+
+    n, _seq_l, feat = Xa.shape
+    if n < 48:
+        return None
+    mu = Xa.mean(axis=(0, 1), keepdims=True)
+    sg = np.maximum(Xa.std(axis=(0, 1), keepdims=True), 1e-4)
+    Xn = (Xa - mu) / sg
+
+    class _Net(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lstm = nn.LSTM(feat, hidden, batch_first=True, num_layers=1)
+            self.fc = nn.Linear(hidden, 1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            o, _ = self.lstm(x)
+            return self.fc(o[:, -1, :]).squeeze(-1)
+
+    net = _Net()
+    opt = torch.optim.Adam(net.parameters(), lr=0.01)
+    Xt = torch.from_numpy(Xn.astype(np.float32))
+    yt = torch.from_numpy(ya.astype(np.float32))
+    net.train()
+    bs = min(128, n)
+    for _ in range(epochs):
+        perm = torch.randperm(n)
+        for i in range(0, n, bs):
+            batch = perm[i : i + bs]
+            xb = Xt[batch]
+            yb = yt[batch]
+            opt.zero_grad()
+            pred = net(xb)
+            loss = torch.mean((pred - yb) ** 2)
+            loss.backward()
+            opt.step()
+    net.eval()
+    return net.cpu(), mu.astype(np.float32), sg.astype(np.float32)
+
+
+def _lstm_predict_one(net: Any, mu: np.ndarray, sg: np.ndarray, x_seq: np.ndarray) -> float:
+    import torch
+
+    # ``mu`` / ``sg`` are stored as (1, 1, feat) from 3D training stats; for 2D ``x_seq`` (seq, feat)
+    # subtracting (1,1,feat) wrongly broadcasts to (1, seq, feat) in NumPy. Use 1D (feat,) instead.
+    x2 = np.asarray(x_seq, dtype=np.float64)
+    while x2.ndim > 2:
+        x2 = x2.squeeze(0)
+    if x2.ndim == 1:
+        x2 = x2.reshape(1, -1)
+    feat = x2.shape[1]
+    m = np.asarray(mu, dtype=np.float64).reshape(-1)[:feat]
+    s = np.maximum(np.asarray(sg, dtype=np.float64).reshape(-1)[:feat], 1e-4)
+    xn = ((x2 - m) / s).astype(np.float32)
+    xt = torch.from_numpy(xn).unsqueeze(0)
+    with torch.no_grad():
+        return float(net(xt).squeeze().cpu().numpy())
+
+
+def walk_forward_lstm(
+    X: pd.DataFrame,
+    y: pd.Series,
+    freq: str,
+    cfg: EvalConfig,
+    h: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    Small univariate-sequence regressor over **lagged rows** of top exogenous columns (same embargo on
+    training targets as tabular walk-forward: sample endpoints ``j <= t-h``).
+    """
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+
+    n = len(y)
+    yv = y.to_numpy(dtype=float)
+    cols = list(X.columns)
+
+    if freq == "hourly":
+        C = cfg.hourly_sliding_context
+        t_first, t_end = hourly_eval_t_range(n, C, cfg.hourly_eval_tail)
+        if t_first >= t_end:
+            return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+        ex_lo = max(0, t_first - C)
+        lstm_cols = select_top_exog(X.iloc[ex_lo:t_first], y.iloc[ex_lo:t_first], cfg.lstm_feature_top_k)
+    else:
+        t_first = min_train_for_freq(freq, cfg)
+        t_end = n
+        min_tr = min_train_for_freq(freq, cfg)
+        lstm_cols = select_top_exog(X.iloc[:min_tr], y.iloc[:min_tr], cfg.lstm_feature_top_k)
+
+    lstm_cols = [c for c in lstm_cols if c in X.columns]
+    if not lstm_cols:
+        return (np.asarray([]), np.asarray([]), np.asarray([]), [])
+
+    Xf = X[lstm_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    Xsel = Xf.to_numpy(dtype=float)
+    seq = cfg.lstm_seq_len
+    refit_every = refit_every_for_freq(freq, cfg)
+
+    y_true_list: list[float] = []
+    y_pred_list: list[float] = []
+    idx_list: list[int] = []
+    pack: tuple[Any, np.ndarray, np.ndarray] | None = None
+
+    for t in range(t_first, t_end):
+        if freq == "hourly":
+            start = t - C
+        else:
+            start = 0
+        train_end = t - h + 1
+        if train_end <= start + seq:
+            y_true_list.append(float(yv[t]))
+            y_pred_list.append(float("nan"))
+            idx_list.append(t)
+            continue
+
+        do_refit = (t == t_first) or ((t - t_first) % refit_every == 0)
+        if do_refit or pack is None:
+            j_list = list(range(start + seq, train_end))
+            if len(j_list) > 4000:
+                step = max(1, len(j_list) // 4000)
+                j_list = j_list[::step]
+            X_list: list[np.ndarray] = []
+            y_list: list[float] = []
+            for j in j_list:
+                X_list.append(Xsel[j - seq : j, :])
+                y_list.append(float(yv[j]))
+            if len(X_list) < 64:
+                pack = None
+            else:
+                Xa = np.stack(X_list, axis=0).astype(np.float32)
+                ya = np.asarray(y_list, dtype=np.float32)
+                pack = _train_lstm_once(Xa, ya, cfg.lstm_hidden, cfg.lstm_epochs)
+
+        y_hat = float("nan")
+        if pack is not None:
+            net, mu, sg = pack
+            try:
+                y_hat = _lstm_predict_one(net, mu, sg, Xsel[t - seq : t, :])
+            except Exception:
+                y_hat = float("nan")
+        y_true_list.append(float(yv[t]))
+        y_pred_list.append(y_hat)
+        idx_list.append(t)
+
+    return (
+        np.asarray(y_true_list),
+        np.asarray(y_pred_list),
+        np.asarray(idx_list),
+        [],
+    )
+
+
 def walk_forward_nlinear(
     timestamps: pd.Series,
     y: pd.Series,
@@ -603,14 +917,8 @@ def walk_forward_nlinear(
     cfg: EvalConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """
-    `NLinear` (NeuralForecast): linear layer over the lag window.
-
-    Daily: same walk-forward grid as other models — expanding history ``0..t-1``, origins ``t``
-    from ``min_train_daily`` through ``n-1``; ``input_size`` = ``daily_neural_context``.
-    Hourly: same as other hourly models — sliding ``hourly_sliding_context`` rows, eval only on
-    the last ``hourly_eval_tail`` rows.
+    `NLinear` (NeuralForecast): horizon-aware label embargo; ``h``-step forecast matches ``y[t]``.
     """
-    _ = h
     try:
         from neuralforecast import NeuralForecast
         from neuralforecast.models import NLinear
@@ -635,6 +943,7 @@ def walk_forward_nlinear(
         t_first = min_train_for_freq(freq, cfg)
         t_end = n
 
+    hz = max(int(h), 1)
     y_true_list: list[float] = []
     y_pred_list: list[float] = []
     idx_list: list[int] = []
@@ -642,29 +951,43 @@ def walk_forward_nlinear(
     for t in range(t_first, t_end):
         if (t - t_first) % cfg.ts_eval_stride != 0:
             continue
+        train_end = t - h + 1
         if freq == "hourly":
             start = t - context
+            if train_end <= start:
+                y_true_list.append(float(yv[t]))
+                y_pred_list.append(float("nan"))
+                idx_list.append(t)
+                continue
             train_df = pd.DataFrame(
                 {
                     "unique_id": "s",
-                    "ds": ds.iloc[start:t].values,
-                    "y": yv[start:t],
+                    "ds": ds.iloc[start:train_end].values,
+                    "y": yv[start:train_end],
                 }
             )
         else:
+            if train_end <= 0:
+                y_true_list.append(float(yv[t]))
+                y_pred_list.append(float("nan"))
+                idx_list.append(t)
+                continue
             train_df = pd.DataFrame(
                 {
                     "unique_id": "s",
-                    "ds": ds.iloc[:t].values,
-                    "y": yv[:t],
+                    "ds": ds.iloc[:train_end].values,
+                    "y": yv[:train_end],
                 }
             )
+
+        n_tr = len(train_df)
+        inp_sz = min(context, max(n_tr - hz - 5, 5))
         y_hat = float(np.nan)
-        if len(train_df) >= context + 5:
+        if n_tr >= inp_sz + hz + 2:
             try:
                 mdl = NLinear(
-                    h=1,
-                    input_size=context,
+                    h=hz,
+                    input_size=inp_sz,
                     max_steps=cfg.neural_max_steps,
                     accelerator="cpu",
                     enable_progress_bar=False,
@@ -673,7 +996,10 @@ def walk_forward_nlinear(
                 nf.fit(df=train_df, verbose=False)
                 fut = nf.predict()
                 val_cols = [c for c in fut.columns if c not in ("unique_id", "ds")]
-                y_hat = float(fut[val_cols[0]].iloc[0]) if val_cols else float("nan")
+                if val_cols and len(fut) >= hz:
+                    y_hat = float(fut[val_cols[0]].iloc[hz - 1])
+                elif val_cols:
+                    y_hat = float(fut[val_cols[0]].iloc[-1])
             except Exception:
                 y_hat = float(np.nan)
         y_true_list.append(float(yv[t]))
@@ -907,7 +1233,8 @@ def run_all(cfg: EvalConfig) -> None:
     )
     print(
         f"  merge_dir={cfg.merge_dir}  |  files={len(paths)}  |  ts_eval_stride={cfg.ts_eval_stride}  |  "
-        f"skip_prophet={cfg.skip_prophet}  skip_neural={cfg.skip_neural}",
+        f"skip_prophet={cfg.skip_prophet}  skip_neural={cfg.skip_neural}  "
+        f"skip_garch={cfg.skip_garch}  skip_lstm={cfg.skip_lstm}",
         flush=True,
     )
     print(
@@ -979,6 +1306,7 @@ def run_all(cfg: EvalConfig) -> None:
                     random_state=42,
                 ),
                 "RF",
+                h,
             )
             if should_emit_figures(cfg, path.name):
                 plot_candidates["RandomForest"] = (yt, yp, ix)
@@ -1003,6 +1331,7 @@ def run_all(cfg: EvalConfig) -> None:
                     verbosity=0,
                 ),
                 "XGB",
+                h,
             )
             if should_emit_figures(cfg, path.name):
                 plot_candidates["XGBoost"] = (yt, yp, ix)
@@ -1011,10 +1340,11 @@ def run_all(cfg: EvalConfig) -> None:
                 row
             )
 
-            yt, yp, ix, _ = walk_forward_arima(y, X, freq, cfg)
+            arima_label = "SARIMAX" if cfg.use_sarimax_exog else "ARIMA"
+            yt, yp, ix, _ = walk_forward_arima(y, X, freq, cfg, h)
             if should_emit_figures(cfg, path.name):
-                plot_candidates["ARIMAX"] = (yt, yp, ix)
-            row = compute_metrics_row("ARIMAX", stem, family, h, yt, yp, ix, y_full)
+                plot_candidates[arima_label] = (yt, yp, ix)
+            row = compute_metrics_row(arima_label, stem, family, h, yt, yp, ix, y_full)
             (tables_ret if family == "return" else tables_vol if family == "volatility" else tables_volume).append(
                 row
             )
@@ -1032,6 +1362,24 @@ def run_all(cfg: EvalConfig) -> None:
                 if should_emit_figures(cfg, path.name):
                     plot_candidates["Prophet"] = (yt, yp, ix)
                 row = compute_metrics_row("Prophet", stem, family, h, yt, yp, ix, y_full)
+                (tables_ret if family == "return" else tables_vol if family == "volatility" else tables_volume).append(
+                    row
+                )
+
+            if family == "volatility" and not cfg.skip_garch:
+                yt, yp, ix, _ = walk_forward_garch(df, y, freq, cfg, h)
+                if should_emit_figures(cfg, path.name):
+                    plot_candidates["GARCH"] = (yt, yp, ix)
+                row = compute_metrics_row("GARCH", stem, family, h, yt, yp, ix, y_full)
+                (tables_ret if family == "return" else tables_vol if family == "volatility" else tables_volume).append(
+                    row
+                )
+
+            if not cfg.skip_lstm:
+                yt, yp, ix, _ = walk_forward_lstm(X, y, freq, cfg, h)
+                if should_emit_figures(cfg, path.name):
+                    plot_candidates["LSTM"] = (yt, yp, ix)
+                row = compute_metrics_row("LSTM", stem, family, h, yt, yp, ix, y_full)
                 (tables_ret if family == "return" else tables_vol if family == "volatility" else tables_volume).append(
                     row
                 )
@@ -1151,7 +1499,7 @@ def parse_args() -> EvalConfig:
         help="Subset of merged CSV filenames (e.g. bitcoin_ohlcv_daily_merged.csv). Default: all.",
     )
     p.add_argument("--refit-every-daily", type=int, default=1)
-    p.add_argument("--refit-every-hourly", type=int, default=168)
+    p.add_argument("--refit-every-hourly", type=int, default=1)
     p.add_argument("--min-train-daily", type=int, default=300)
     p.add_argument("--min-train-hourly", type=int, default=2000)
     p.add_argument("--max-rows-daily", type=int, default=None)
@@ -1162,8 +1510,8 @@ def parse_args() -> EvalConfig:
         "--ts-eval-stride",
         type=int,
         default=1,
-        help="Evaluate ARIMA/Prophet/VAR/NLinear every k-th origin (1=all). Hourly stride is vs first tail origin. "
-        "Sklearn predicts every step in the evaluated range (daily: from min_train; hourly: last tail rows).",
+        help="Evaluate ARIMA/SARIMAX/Prophet/GARCH/VAR/NLinear every k-th origin (1=all). Hourly stride is vs first tail origin. "
+        "Sklearn and LSTM predict every step in the evaluated range (daily: from min_train; hourly: last tail rows).",
     )
     p.add_argument(
         "--neural-max-steps",
@@ -1174,7 +1522,7 @@ def parse_args() -> EvalConfig:
     p.add_argument(
         "--use-sarimax-exog",
         action="store_true",
-        help="Try SARIMAX with top correlated exog before ARIMA (slower).",
+        help="Use SARIMAX with top correlated exog (default is pure ARIMA).",
     )
     p.add_argument(
         "--plot-dataset",
@@ -1203,6 +1551,25 @@ def parse_args() -> EvalConfig:
         default=90,
         help="Daily NLinear input_size (expanding-window training).",
     )
+    p.add_argument(
+        "--enable-garch",
+        action="store_true",
+        help="Include GARCH(1,1) on log returns for volatility targets (installs ``arch``; slower).",
+    )
+    p.add_argument(
+        "--enable-lstm",
+        action="store_true",
+        help="Include LSTM on lagged top exogenous features for return/volatility (uses ``torch``; slower).",
+    )
+    p.add_argument("--lstm-hidden", type=int, default=32, help="LSTM hidden units.")
+    p.add_argument("--lstm-seq-len", type=int, default=24, help="LSTM lag window length (bars).")
+    p.add_argument("--lstm-epochs", type=int, default=8, help="LSTM Adam epochs per refit window.")
+    p.add_argument(
+        "--lstm-feature-top-k",
+        type=int,
+        default=12,
+        help="Number of exogenous columns (by |corr| with y) fed to LSTM.",
+    )
     args = p.parse_args()
     return EvalConfig(
         merge_dir=args.merge_dir,
@@ -1225,6 +1592,12 @@ def parse_args() -> EvalConfig:
         target_pairs_by_freq=None,
         neural_max_steps=args.neural_max_steps,
         daily_neural_context=args.daily_neural_context,
+        skip_garch=not args.enable_garch,
+        skip_lstm=not args.enable_lstm,
+        lstm_hidden=args.lstm_hidden,
+        lstm_seq_len=args.lstm_seq_len,
+        lstm_epochs=args.lstm_epochs,
+        lstm_feature_top_k=args.lstm_feature_top_k,
     )
 
 

@@ -144,10 +144,11 @@ def _run_walkforward_mae(
     freq: str,
     cfg: EvalConfig,
     model_kind: str,
+    horizon: int,
 ) -> tuple[float, float]:
     factory = _make_model_factory(cfg, model_kind)
     name = "RF" if model_kind == "rf" else "XGB"
-    yt, yp, ix, _ = walk_forward_sklearn(X, y, freq, cfg, factory, name)
+    yt, yp, ix, _ = walk_forward_sklearn(X, y, freq, cfg, factory, name, horizon)
     m = np.isfinite(yt) & np.isfinite(yp)
     if not np.any(m):
         return float("nan"), float("nan")
@@ -161,6 +162,7 @@ def run_ablation(
     cfg: EvalConfig,
     model_kind: str,
     strict_ohlcv: bool,
+    horizon: int,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for label, cols in _ablation_column_sets(X, strict_ohlcv):
@@ -169,7 +171,7 @@ def run_ablation(
         Xs = X[[c for c in cols if c in X.columns]]
         if Xs.shape[1] == 0:
             continue
-        mae_v, rmse_v = _run_walkforward_mae(Xs, y, freq, cfg, model_kind)
+        mae_v, rmse_v = _run_walkforward_mae(Xs, y, freq, cfg, model_kind, horizon)
         rows.append(
             {
                 "mode": "ablation",
@@ -189,6 +191,7 @@ def run_context_daily(
     base: EvalConfig,
     model_kind: str,
     min_train_grid: list[int],
+    horizon: int,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for mtr in min_train_grid:
@@ -206,7 +209,7 @@ def run_context_daily(
             skip_prophet=True,
             skip_neural=True,
         )
-        mae_v, rmse_v = _run_walkforward_mae(X, y, freq, cfg, model_kind)
+        mae_v, rmse_v = _run_walkforward_mae(X, y, freq, cfg, model_kind, horizon)
         rows.append(
             {
                 "mode": "context_daily",
@@ -227,6 +230,7 @@ def run_context_hourly(
     model_kind: str,
     context_grid: list[int],
     hourly_tail: int,
+    horizon: int,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for C in context_grid:
@@ -244,7 +248,7 @@ def run_context_hourly(
             skip_prophet=True,
             skip_neural=True,
         )
-        mae_v, rmse_v = _run_walkforward_mae(X, y, freq, cfg, model_kind)
+        mae_v, rmse_v = _run_walkforward_mae(X, y, freq, cfg, model_kind, horizon)
         rows.append(
             {
                 "mode": "context_hourly",
@@ -424,7 +428,7 @@ def main() -> None:
     }
 
     if "ablation" in modes:
-        rows = run_ablation(X, y, freq, base_cfg, args.model, args.strict_ohlcv)
+        rows = run_ablation(X, y, freq, base_cfg, args.model, args.strict_ohlcv, args.horizon)
         all_rows.extend(rows)
         print("=== Ablation (feature groups) ===")
         print(pd.DataFrame(rows).to_string(index=False))
@@ -433,11 +437,11 @@ def main() -> None:
     if "context" in modes:
         if freq == "daily":
             grid = _parse_int_list(args.min_train_grid)
-            rows = run_context_daily(X, y, freq, base_cfg, args.model, grid)
+            rows = run_context_daily(X, y, freq, base_cfg, args.model, grid, args.horizon)
         else:
             grid = _parse_int_list(args.hourly_context_grid)
             rows = run_context_hourly(
-                X, y, freq, base_cfg, args.model, grid, args.hourly_eval_tail
+                X, y, freq, base_cfg, args.model, grid, args.hourly_eval_tail, args.horizon
             )
         all_rows.extend(rows)
         print("=== Context sweep ===")
